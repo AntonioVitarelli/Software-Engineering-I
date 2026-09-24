@@ -1,0 +1,164 @@
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.DAO.customer_dao import CustomerDAO
+from app.models.DAO.loyalty_card_dao import LoyaltyCardDAO
+from typing import Optional, List
+from app.database.database import AsyncSessionLocal
+
+class CustomerRepository:
+    def __init__(self, session: Optional[AsyncSession] = None):
+        self._session = session
+        
+    async def _get_session(self) -> AsyncSession:
+        return self._session or AsyncSessionLocal()
+    
+    async def create_customer(self, name: str, cardId: Optional[str] = None) -> CustomerDAO:
+        """
+        Create a new customer with optional loyalty card.
+        """
+        async with await self._get_session() as session:
+            customer = CustomerDAO(name=name, cardId=cardId)
+            session.add(customer)
+            await session.commit()
+            await session.refresh(customer)
+            return customer
+    
+    async def card_already_attached(self, card_id: str, exclude_customer_id: Optional[int] = None) -> bool:
+        """
+        Check if a card is already attached to another customer.
+        Returns True if card is attached to a different customer, False otherwise.
+        exclude_customer_id: If provided, ignores this customer (used in updates to allow reassigning same card)
+        """
+        async with await self._get_session() as session:
+            # Query: find customer that has this card
+            result = await session.execute(
+                select(CustomerDAO).where(CustomerDAO.cardId == card_id)
+            )
+            existing = result.scalar_one_or_none()
+            
+            # If card is attached and it's not the excluded customer, return True (conflict)
+            if existing and (exclude_customer_id is None or existing.id != exclude_customer_id):
+                return True
+            return False
+                
+    async def get_customer(self, customer_id: int) -> Optional[CustomerDAO]:        
+        """
+        Get customer by id.
+        """
+        async with await self._get_session() as session:
+            customer = await session.get(CustomerDAO, customer_id)
+            return customer
+         
+    async def get_card(self, card_id: str) -> Optional[LoyaltyCardDAO]:
+        """
+        Get card by id.
+        """
+        async with await self._get_session() as session:
+            return await session.get(LoyaltyCardDAO, card_id)  
+         
+    async def list_customer(self) -> List[CustomerDAO]:
+        """
+        Get all customers.
+        """
+        async with await self._get_session() as session:
+            result = await session.execute(select(CustomerDAO))
+            return result.scalars().all()
+
+    async def update_customer(self, customer_id: int, updated_name: Optional[str] = None, updated_cardId: Optional[str] = None) -> CustomerDAO:
+        """
+        Update customer name and/or card.
+        - If updated_cardId is provided: attach the card.
+        - If updated_cardId is empty string: detach card from customer and delete it.
+        - If updated_cardId is None: don't modify card.
+        """
+        async with await self._get_session() as session:
+            db_customer = await session.get(CustomerDAO, customer_id)
+            
+            # Update name if provided
+            if updated_name:
+                db_customer.name = updated_name
+            
+            # Handle card: attach, detach, or skip
+            if updated_cardId is not None and updated_cardId != "":
+                # Attach new card
+                db_customer.cardId = updated_cardId
+            elif updated_cardId == "" and db_customer.cardId:
+                # Detach card: delete the old card
+                old_card = await session.get(LoyaltyCardDAO, db_customer.cardId)
+                if old_card:
+                    await session.delete(old_card)
+                db_customer.cardId = None
+            # If updated_cardId is None, do nothing (don't update card)
+
+            await session.commit()
+            await session.refresh(db_customer)
+            return db_customer
+
+    async def delete_customer(self, customer_id: int) -> bool:
+        """
+        Delete a customer by id. If a card is attached, the card is deleted as well.
+        """
+        async with await self._get_session() as session:
+            customer = await session.get(CustomerDAO, customer_id)
+            # If customer has a card attached, delete it too
+            if customer.cardId:
+                card_dao = await session.get(LoyaltyCardDAO, customer.cardId)
+                if card_dao:
+                    await session.delete(card_dao)
+            # Delete the customer
+            await session.delete(customer)
+            await session.commit()
+            return True
+        
+    async def create_card(self) -> LoyaltyCardDAO:
+        """
+        Create a new loyalty card with auto-generated 10-digit ID and 0 points.
+        ID is generated by incrementing the last card ID, or "0000000001" if no cards exist.
+        """
+        async with await self._get_session() as session:
+            # Get the last card to generate next ID
+            result = await session.execute(
+                select(LoyaltyCardDAO).order_by(LoyaltyCardDAO.id.desc()).limit(1)
+            )
+            last_card = result.scalar_one_or_none()
+            
+            # Generate new ID: increment last card ID or start from 1
+            if last_card:
+                card_id = str(int(last_card.id) + 1).zfill(10)  # Convert to int, add 1, pad to 10 digits
+            else:
+                card_id = "0000000001"  # First card
+            
+            # Create card with 0 points
+            card = LoyaltyCardDAO(id=card_id, points=0)
+            session.add(card)
+            await session.commit()
+            await session.refresh(card)
+            return card
+            
+    async def attach_card_to_customer(self, customer_id: int, cardId: str) -> CustomerDAO:
+        """
+        Attach a loyalty card to a customer.
+        """
+        async with await self._get_session() as session:
+            customer = await session.get(CustomerDAO, customer_id)
+            customer.cardId = cardId
+            await session.commit()
+            await session.refresh(customer)
+            return customer
+        
+    async def update_card_points(self, cardId: str, points: int) -> LoyaltyCardDAO:
+        """
+        Update loyalty card's points (add or subtract).
+        Points can be negative input to subtract from card points.
+        Controller validates that result won't be negative before calling this.
+        """
+        async with await self._get_session() as session:
+            card = await session.get(LoyaltyCardDAO, cardId)
+            
+            # Update points (can be positive or negative)
+            card.points = card.points + points
+            await session.commit()
+            await session.refresh(card)
+            return card
+            
+           
